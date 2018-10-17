@@ -13,8 +13,8 @@
 
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 enum ThisOrThat<T, U> {
     This(T),
@@ -31,12 +31,48 @@ pub struct LazyTransform<T, U> {
 
 // Implementation details.
 impl<T, U> LazyTransform<T, U> {
+    fn create<F>(&self, f: F)
+    where
+        F: FnOnce(T) -> U,
+    {
+        // In addition to being correct, this pattern is vouched for by Hans Boehm
+        // (http://schd.ws/hosted_files/cppcon2016/74/HansWeakAtomics.pdf Page 27)
+        if !self.initialized.load(Ordering::Acquire) {
+            // We *may* not be initialized. We have to block to be certain.
+            let _lock = self.lock.lock().unwrap();
+            if !self.initialized.load(Ordering::Relaxed) {
+                // Ok, we're definitely uninitialized.
+                // Safe to fiddle with the UnsafeCell now, because we're locked,
+                // and there can't be any outstanding references.
+                let value = unsafe { &mut *self.value.get() };
+                let this = match value.take().unwrap() {
+                    ThisOrThat::This(t) => t,
+                    ThisOrThat::That(_) => panic!(), // Can't already be initialized!
+                };
+                *value = Some(ThisOrThat::That(f(this)));
+                self.initialized.store(true, Ordering::Release);
+            } else {
+                // We raced, and someone else initialized us. We can fall
+                // through now.
+            }
+        }
+    }
+
     fn extract(&self) -> Option<&U> {
         // Make sure we're initialized first!
         match unsafe { (*self.value.get()).as_ref() } {
             None => None,
             Some(&ThisOrThat::This(_)) => panic!(), // Should already be initialized!
             Some(&ThisOrThat::That(ref that)) => Some(that),
+        }
+    }
+
+    fn extract_mut(&mut self) -> Option<&mut U> {
+        // Make sure we're initialized first!
+        match unsafe { (*self.value.get()).as_mut() } {
+            None => None,
+            Some(&mut ThisOrThat::This(_)) => panic!(), // Should already be initialized!
+            Some(&mut ThisOrThat::That(ref mut that)) => Some(that),
         }
     }
 }
@@ -76,32 +112,30 @@ impl<T, U> LazyTransform<T, U> {
     /// The closure can only ever be called once, so think carefully about what
     /// transformation you want to apply!
     pub fn get_or_create<F>(&self, f: F) -> &U
-        where F: FnOnce(T) -> U
+    where
+        F: FnOnce(T) -> U,
     {
-        // In addition to being correct, this pattern is vouched for by Hans Boehm
-        // (http://schd.ws/hosted_files/cppcon2016/74/HansWeakAtomics.pdf Page 27)
-        if !self.initialized.load(Ordering::Acquire) {
-            // We *may* not be initialized. We have to block to be certain.
-            let _lock = self.lock.lock().unwrap();
-            if !self.initialized.load(Ordering::Relaxed) {
-                // Ok, we're definitely uninitialized.
-                // Safe to fiddle with the UnsafeCell now, because we're locked,
-                // and there can't be any outstanding references.
-                let value = unsafe { &mut *self.value.get() };
-                let this = match value.take().unwrap() {
-                    ThisOrThat::This(t) => t,
-                    ThisOrThat::That(_) => panic!(), // Can't already be initialized!
-                };
-                *value = Some(ThisOrThat::That(f(this)));
-                self.initialized.store(true, Ordering::Release);
-            } else {
-                // We raced, and someone else initialized us. We can fall
-                // through now.
-            }
-        }
+        self.create(f);
 
         // We're initialized, our value is immutable, no synchronization needed.
         self.extract().unwrap()
+    }
+
+    /// Get a mutable reference to the transformed value, invoking `f` to transform it
+    /// if the `LazyTransform<T, U>` has yet to be transformed.  It is
+    /// guaranteed that if multiple calls to `get_or_create_mut` race, only one
+    /// will invoke its closure, and every call will receive a reference to the
+    /// newly transformed value.
+    ///
+    /// The closure can only ever be called once, so think carefully about what
+    /// transformation you want to apply!
+    pub fn get_or_create_mut<F>(&mut self, f: F) -> &mut U
+    where
+        F: FnOnce(T) -> U,
+    {
+        self.create(f);
+
+        self.extract_mut().unwrap()
     }
 
     /// Get a reference to the transformed value, returning `Some(&U)` if the
@@ -119,14 +153,16 @@ impl<T, U> LazyTransform<T, U> {
 }
 
 unsafe impl<T, U> Sync for LazyTransform<T, U>
-    where T: Sync + Send,
-          U: Sync
+where
+    T: Sync + Send,
+    U: Sync,
 {
 }
 
 impl<T, U> Default for LazyTransform<T, U>
-    where T: Sync + Default,
-          U: Sync
+where
+    T: Sync + Default,
+    U: Sync,
 {
     fn default() -> Self {
         LazyTransform::new(T::default())
@@ -161,9 +197,24 @@ impl<T> Lazy<T> {
     /// The value stored in the `Lazy<T>` is immutable after the closure returns
     /// it, so think carefully about what you want to put inside!
     pub fn get_or_create<F>(&self, f: F) -> &T
-        where F: FnOnce() -> T
+    where
+        F: FnOnce() -> T,
     {
         self.inner.get_or_create(|_| f())
+    }
+
+    /// Get a mutable reference to the contained value, invoking `f` to create it
+    /// if the `Lazy<T>` is uninitialized.  It is guaranteed that if multiple
+    /// calls to `get_or_create_mut` race, only one will invoke its closure, and
+    /// every call will receive a reference to the newly created value.
+    ///
+    /// The value stored in the `Lazy<T>` is immutable after the closure returns
+    /// it, so think carefully about what you want to put inside!
+    pub fn get_or_create_mut<F>(&mut self, f: F) -> &mut T
+    where
+        F: FnOnce() -> T,
+    {
+        self.inner.get_or_create_mut(|_| f())
     }
 
     /// Get a reference to the contained value, returning `Some(ref)` if the
@@ -179,12 +230,15 @@ impl<T> Lazy<T> {
 // is too restrictive, because `Lazy<T>` always has a default value for any `T`.
 impl<T> Default for Lazy<T> {
     fn default() -> Self {
-        Lazy { inner: LazyTransform::new(()) }
+        Lazy {
+            inner: LazyTransform::new(()),
+        }
     }
 }
 
 impl<T> fmt::Debug for Lazy<T>
-    where T: fmt::Debug + Sync
+where
+    T: fmt::Debug + Sync,
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if let Some(v) = self.get() {
@@ -201,10 +255,10 @@ extern crate scoped_pool;
 #[cfg(test)]
 mod tests {
 
-    use scoped_pool::Pool;
-    use std::{thread, time};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use super::{Lazy, LazyTransform};
+    use scoped_pool::Pool;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{thread, time};
 
     #[test]
     fn test_lazy() {
